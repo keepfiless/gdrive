@@ -1,0 +1,242 @@
+name: 000_3 download list 60per time
+
+on:
+  workflow_dispatch:
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install gdown
+        run: pip install gdown --upgrade
+
+      - name: Install rar
+        run: sudo apt-get install -y rar
+
+      - name: Check list.txt has content
+        id: check_list
+        run: |
+          if [ ! -f "list.txt" ] || [ ! -s "list.txt" ]; then
+            echo "list.txt is empty or missing — nothing to download."
+            echo "has_work=false" >> $GITHUB_OUTPUT
+          else
+            TOTAL=$(grep -c "=" list.txt || echo 0)
+            echo "list.txt has $TOTAL entries."
+            echo "has_work=true"  >> $GITHUB_OUTPUT
+            echo "total=$TOTAL"   >> $GITHUB_OUTPUT
+          fi
+
+      - name: Read done.txt and pick next 100 links
+        if: steps.check_list.outputs.has_work == 'true'
+        id: pick
+        run: |
+          cat > pick.py << 'PYTHON_SCRIPT'
+          import os
+
+          with open("list.txt") as f:
+              all_lines = [l.strip() for l in f if l.strip() and "=" in l]
+
+          total = len(all_lines)
+
+          done_urls = set()
+          if os.path.exists("done.txt"):
+              with open("done.txt") as f:
+                  for line in f:
+                      line = line.strip()
+                      if line.startswith("https://"):
+                          done_urls.add(line)
+
+          done_count = len(done_urls)
+
+          if done_count >= total:
+              print("ALL_DONE")
+              with open("pick_result.txt", "w") as f:
+                  f.write("ALL_DONE\n")
+          else:
+              pending = []
+              for line in all_lines:
+                  parts = line.split("=", 1)
+                  folder = parts[0].strip()
+                  url    = parts[1].strip()
+                  if url not in done_urls:
+                      pending.append((folder, url))
+
+              batch = pending[:60]
+
+              with open("pick_result.txt", "w") as f:
+                  for folder, url in batch:
+                      f.write(f"{folder} = {url}\n")
+
+              print(f"Total: {total} | Done: {done_count} | Picking: {len(batch)}")
+
+          with open("counts.txt", "w") as f:
+              f.write(f"{total}\n{done_count}\n")
+          PYTHON_SCRIPT
+
+          python pick.py
+          rm pick.py
+
+          if grep -q "ALL_DONE" pick_result.txt; then
+            echo "status=all_done" >> $GITHUB_OUTPUT
+          else
+            BATCH=$(wc -l < pick_result.txt)
+            echo "status=has_batch" >> $GITHUB_OUTPUT
+            echo "batch_size=$BATCH" >> $GITHUB_OUTPUT
+          fi
+
+      - name: All files already downloaded
+        if: steps.pick.outputs.status == 'all_done'
+        run: |
+          TOTAL=$(sed -n '1p' counts.txt)
+          echo "✅ All $TOTAL files have already been downloaded!"
+
+      - name: Download batch and update done.txt
+        if: steps.pick.outputs.status == 'has_batch'
+        run: |
+          cat > download_batch.py << 'PYTHON_SCRIPT'
+          import os
+          import re
+          import subprocess
+
+          with open("pick_result.txt") as f:
+              batch = []
+              for line in f:
+                  line = line.strip()
+                  if not line or "=" not in line:
+                      continue
+                  folder, url = line.split("=", 1)
+                  batch.append((folder.strip(), url.strip()))
+
+          done_urls = set()
+          if os.path.exists("done.txt"):
+              with open("done.txt") as f:
+                  for line in f:
+                      line = line.strip()
+                      if line.startswith("https://"):
+                          done_urls.add(line)
+
+          with open("counts.txt") as f:
+              counts = f.read().splitlines()
+          total      = int(counts[0])
+          done_start = int(counts[1])
+
+          newly_done = []
+          failed     = []
+
+          for i, (folder, url) in enumerate(batch, 1):
+              os.makedirs(folder, exist_ok=True)
+              print(f"\n[{i}/{len(batch)}] Downloading to: {folder}/")
+              print(f"  URL: {url}")
+
+              # Extract file ID from URL
+              id_match = re.search(r'id=([a-zA-Z0-9_-]+)', url)
+              if not id_match:
+                  failed.append((folder, url))
+                  print(f"  ❌ Could not extract file ID")
+                  continue
+
+              file_id   = id_match.group(1)
+              clean_url = f"https://drive.google.com/uc?id={file_id}&confirm=t&export=download"
+
+              try:
+                  result = subprocess.run(
+                      ["gdown", clean_url, "-O", f"{folder}/"],
+                      timeout=600,
+                  )
+                  if result.returncode == 0:
+                      # Check if any downloaded file exceeds 99 MB and split into RAR parts
+                      downloaded_files = [
+                          os.path.join(folder, fn)
+                          for fn in os.listdir(folder)
+                      ]
+                      for fpath in downloaded_files:
+                          if os.path.isfile(fpath) and os.path.getsize(fpath) > 99 * 1024 * 1024:
+                              base = os.path.splitext(os.path.basename(fpath))[0]
+                              rar_prefix = os.path.join(folder, base)
+                              print(f"  📦 File >99MB, splitting: {fpath}")
+                              rar_result = subprocess.run(
+                                  ["rar", "a", "-v99m", f"{rar_prefix}.rar", fpath],
+                              )
+                              if rar_result.returncode == 0:
+                                  os.remove(fpath)
+                                  print(f"  ✅ Split into RAR parts and original removed")
+                              else:
+                                  print(f"  ⚠️ RAR split failed, keeping original file")
+                      newly_done.append(url)
+                      print(f"  ✅ Done")
+                  else:
+                      failed.append((folder, url))
+                      print(f"  ❌ Failed (exit code {result.returncode})")
+              except subprocess.TimeoutExpired:
+                  failed.append((folder, url))
+                  print(f"  ❌ Timeout")
+              except Exception as e:
+                  failed.append((folder, url))
+                  print(f"  ❌ Error: {e}")
+
+          all_done_urls  = done_urls | set(newly_done)
+          done_new_count = len(all_done_urls)
+
+          with open("done.txt", "w") as f:
+              f.write(f"all:{total}\n")
+              f.write(f"done:{done_new_count}\n")
+              if done_new_count >= total:
+                  f.write("status:COMPLETE ✅\n")
+              else:
+                  f.write(f"remaining:{total - done_new_count}\n")
+              f.write("─" * 40 + "\n")
+              for url in sorted(all_done_urls):
+                  f.write(url + "\n")
+
+          print(f"\n{'=' * 50}")
+          print(f"Batch     : {len(batch)}")
+          print(f"Succeeded : {len(newly_done)}")
+          print(f"Failed    : {len(failed)}")
+          print(f"Total done: {done_new_count} / {total}")
+          if done_new_count >= total:
+              print("🎉 ALL FILES DOWNLOADED!")
+          else:
+              print(f"⏳ {total - done_new_count} files remaining")
+          print(f"{'=' * 50}")
+
+          if failed:
+              print(f"\nFailed URLs ({len(failed)}):")
+              for folder, url in failed:
+                  print(f"  [{folder}] {url}")
+          PYTHON_SCRIPT
+
+          python download_batch.py
+          rm download_batch.py
+
+      - name: Clean up temp files
+        if: always()
+        run: rm -f pick_result.txt counts.txt
+
+      - name: Commit downloaded files and updated done.txt
+        if: steps.pick.outputs.status == 'has_batch'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add --force . 
+          if git diff --staged --quiet; then
+            echo "Nothing new to commit."
+          else
+            DONE=$(grep  "^done:" done.txt | cut -d: -f2)
+            TOTAL=$(grep "^all:"  done.txt | cut -d: -f2)
+            git commit -m "📥 Downloaded batch — $DONE / $TOTAL files complete"
+            git push
+            echo "Committed successfully."
+          fi
