@@ -1,0 +1,188 @@
+name: 00 __ LIST GOOGLE DRIVE LINKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_folder_url:
+        description: 'Google Drive folder URL (public shared link)'
+        required: true
+        type: string
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install gdown
+        run: pip install gdown
+
+      - name: Extract folder ID from URL
+        id: extract_id
+        run: |
+          URL="${{ github.event.inputs.drive_folder_url }}"
+          if [[ "$URL" =~ folders/([a-zA-Z0-9_-]+) ]]; then
+            FOLDER_ID="${BASH_REMATCH[1]}"
+          elif [[ "$URL" =~ id=([a-zA-Z0-9_-]+) ]]; then
+            FOLDER_ID="${BASH_REMATCH[1]}"
+          else
+            FOLDER_ID="$URL"
+          fi
+          echo "folder_id=$FOLDER_ID" >> $GITHUB_OUTPUT
+          echo "Extracted folder ID: $FOLDER_ID"
+
+      - name: Collect full log then kill on first download byte
+        env:
+          FOLDER_ID: ${{ steps.extract_id.outputs.folder_id }}
+        run: |
+          FOLDER_URL="https://drive.google.com/drive/folders/$FOLDER_ID"
+          > gdown_output.log
+
+          # Let gdown run and log everything line by line
+          # Kill only when we see a % progress bar (actual bytes transferring)
+          # This lets all "Processing file" and "To:" lines be captured first
+          while IFS= read -r line; do
+            echo "$line" >> gdown_output.log
+            # Progress bar line looks like: "  0%|" or " 21%|"
+            if [[ "$line" =~ ^[[:space:]]*[0-9]+%\| ]]; then
+              echo "[WATCHER] Transfer started — killing gdown"
+              pkill -9 -f "gdown" 2>/dev/null || true
+              break
+            fi
+          done < <(gdown --folder "$FOLDER_URL" 2>&1)
+
+          echo "----------------------------------------------"
+          echo "Lines captured: $(wc -l < gdown_output.log)"
+          echo "----------------------------------------------"
+
+      - name: Parse log and build list.txt
+        run: |
+          cat > parse.py << 'PYTHON_SCRIPT'
+          import re
+
+          with open("gdown_output.log", "r") as f:
+              lines = f.readlines()
+
+          # -------------------------------------------------------
+          # gdown log structure:
+          #   Processing file <ID> <filename>   <- file entry
+          #   ...
+          #   Downloading...
+          #   From: https://drive.google.com/uc?id=<ID>
+          #   To: /home/runner/work/repo/repo/FolderA/SubFolder/file.mov
+          # 
+          # Strategy:
+          #   Pass 1 — build map of file_id -> filename from Processing lines
+          #   Pass 2 — build map of file_id -> folder_name from To: lines
+          #   Merge both maps to write list.txt
+          # -------------------------------------------------------
+
+          # Pass 1: file_id -> filename
+          id_to_name = {}
+          for line in lines:
+              m = re.match(r'^Processing file ([a-zA-Z0-9_-]{10,})\s+(.+)$', line.strip())
+              if m:
+                  id_to_name[m.group(1)] = m.group(2).strip()
+
+          print(f"Pass 1: found {len(id_to_name)} file IDs from Processing lines")
+
+          # Pass 2: file_id -> parent folder name from To: lines
+          # To: /home/runner/work/repo/repo/RootFolder/SubFolder/filename.ext
+          # The parent folder = the directory just above the filename
+          id_to_folder = {}
+          for line in lines:
+              line = line.strip()
+              m = re.match(r'^To:\s+(.+)$', line)
+              if m:
+                  path = m.group(1).strip()
+                  parts = path.replace("\\", "/").split("/")
+                  # parts[-1] = filename, parts[-2] = parent folder
+                  if len(parts) >= 2:
+                      folder_name = parts[-2]
+                      # Extract file ID from the preceding From: line is complex,
+                      # so match by filename instead
+                      filename = parts[-1]
+                      # Find which file_id has this filename
+                      for fid, fname in id_to_name.items():
+                          if fname == filename:
+                              id_to_folder[fid] = folder_name
+                              break
+
+          print(f"Pass 2: resolved folder for {len(id_to_folder)} files from To: lines")
+
+          # Build list.txt
+          # For files whose folder wasn't seen in To: lines (gdown killed early),
+          # try to infer from the To: lines we did capture by proximity
+          # Fall back to "unknown" only as last resort
+          results = []
+          last_known_folder = "unknown"
+
+          # Process in original order
+          ordered_ids = []
+          for line in lines:
+              m = re.match(r'^Processing file ([a-zA-Z0-9_-]{10,})\s+', line.strip())
+              if m and m.group(1) in id_to_name:
+                  fid = m.group(1)
+                  if fid not in [x[0] for x in ordered_ids]:
+                      ordered_ids.append((fid, id_to_name[fid]))
+
+          for fid, fname in ordered_ids:
+              folder = id_to_folder.get(fid)
+              if folder:
+                  last_known_folder = folder
+              else:
+                  folder = last_known_folder
+              link = f"https://drive.google.com/uc?id={fid}&export=download"
+              results.append(f"{folder} = {link}")
+              print(f"  [{folder}] {fname}")
+
+          with open("list.txt", "w") as f:
+              f.write("\n".join(results) + "\n")
+
+          print(f"\nTotal: {len(results)} files written to list.txt")
+          PYTHON_SCRIPT
+
+          python parse.py
+          rm parse.py
+
+      - name: Clean up
+        run: |
+          rm -f gdown_output.log
+          # Remove any partial file that may have started downloading
+          find . -not -path "./.git/*" \( \
+            -name "*.mov" -o -name "*.mp4" -o -name "*.avi" \
+            -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.png" \
+            -o -name "*.zip" -o -name "*.pdf" \
+          \) -delete 2>/dev/null || true
+
+      - name: Display summary
+        run: |
+          echo "=== list.txt preview (first 20 lines) ==="
+          head -20 list.txt
+          echo "..."
+          echo "Total entries: $(wc -l < list.txt)"
+
+      - name: Commit list.txt to repository
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add list.txt
+          if git diff --staged --quiet; then
+            echo "No changes to list.txt"
+          else
+            FILE_COUNT=$(wc -l < list.txt)
+            git commit -m "📋 Listed $FILE_COUNT files from Google Drive (no download)"
+            git push
+            echo "Done — $FILE_COUNT entries committed."
+          fi
