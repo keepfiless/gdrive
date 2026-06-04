@@ -1,4 +1,4 @@
-name: 01 __ DOWNLOAD FROM LIST
+name: 02- 💾 دانلود از گوگل درایو
 
 on:
   workflow_dispatch:
