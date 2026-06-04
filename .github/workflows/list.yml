@@ -1,4 +1,4 @@
-name: 00 __ LIST FOLDER CONTENTS
+name: 01- 📝 لیست کردن فایلها
 
 on:
   workflow_dispatch:
